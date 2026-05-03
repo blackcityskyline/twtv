@@ -4,142 +4,146 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/user/twtv/internal/blocklist"
 	"github.com/user/twtv/internal/config"
 	"github.com/user/twtv/internal/history"
 	"github.com/user/twtv/internal/player"
 	"github.com/user/twtv/internal/terminal"
 )
 
-const twitchBase = "https://www.twitch.tv/"
-
 func main() {
-	var (
-		chat  = flag.Bool("c", false, "open chat for the channel")
-		quiet = flag.Bool("q", false, "suppress mpv log output")
-		histN = flag.Int("H", 0, "pick from last N history entries (numeric list)")
-	)
-	flag.Usage = usage
+	histFlag := flag.String("H", "", "show history (last N entries)")
+	chatFlag := flag.Bool("c", false, "open chat alongside stream")
+	quietFlag := flag.Bool("q", false, "suppress mpv log output")
 	flag.Parse()
 
 	cfg, err := config.Load()
-	die(err)
+	if err != nil {
+		fatalf("config error: %v", err)
+	}
 
-	hist := history.New(config.ConfigDir, cfg.History.Limit)
+	hist, err := history.New(cfg.History.File, cfg.History.Limit)
+	if err != nil {
+		fatalf("history error: %v", err)
+	}
+
+	bl := blocklist.New(filepath.Join(filepath.Dir(cfg.History.File), "blocklist.txt"))
 	extra := flag.Args()
 
-	switch {
-	case *histN > 0:
-		url, err := pickNumbered(hist, *histN)
-		die(err)
+	// -H <n>: interactive history picker
+	if *histFlag != "" {
+		runHistoryPicker(cfg, hist, extra, *chatFlag, *quietFlag, *histFlag)
+		return
+	}
+
+	// Direct channel / URL argument
+	if len(extra) > 0 {
+		url := toURL(extra[0])
 		ch := channelFromURL(url)
-		maybeChat(cfg, *chat, ch)
-		die(hist.Append(ch, url))
-		die(player.Launch(url, extra, *quiet))
-
-	case flag.NArg() == 0:
-		// no args — open TUI
-		p := tea.NewProgram(newModel(cfg, hist, extra, *quiet))
-		if _, err := p.Run(); err != nil {
-			die(err)
+		_ = hist.Append(ch, url, "")
+		if *chatFlag {
+			openChat(cfg, ch)
 		}
-
-	default:
-		ch := flag.Arg(0)
-		extra = flag.Args()[1:]
-		url := toURL(ch)
-		maybeChat(cfg, *chat, ch)
-		die(hist.Append(ch, url))
-		die(player.Launch(url, extra, *quiet))
-	}
-}
-
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-func toURL(ch string) string {
-	if strings.HasPrefix(ch, "http://") || strings.HasPrefix(ch, "https://") {
-		return ch
-	}
-	return twitchBase + strings.TrimPrefix(ch, "/")
-}
-
-func channelFromURL(url string) string {
-	return strings.TrimPrefix(strings.TrimRight(url, "/"), twitchBase)
-}
-
-func maybeChat(cfg *config.Config, open bool, ch string) {
-	if open {
-		launchChat(cfg, ch)
-	}
-}
-
-func launchChat(cfg *config.Config, ch string) {
-	term := cfg.Chat.Terminal
-	if term == "" {
-		var err error
-		term, err = terminal.Find()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "chat: %v\n", err)
-			return
+		if err := player.Launch(url, extra[1:], *quietFlag); err != nil {
+			fatalf("player error: %v", err)
 		}
+		return
 	}
-	parts := strings.Fields(cfg.Chat.Command)
-	if len(parts) == 0 {
-		parts = []string{"twt", "-c"}
-	}
-	chatBin := parts[0]
-	chatArgs := append(parts[1:], ch)
-	if err := player.LaunchChat(term, chatBin, strings.Join(chatArgs, " ")); err != nil {
-		fmt.Fprintf(os.Stderr, "chat: %v\n", err)
+
+	// TUI mode — always quiet so mpv output doesn't corrupt the interface.
+	m := newModel(cfg, hist, bl, extra, true)
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		fatalf("tui error: %v", err)
 	}
 }
 
-func pickNumbered(hist *history.History, n int) (string, error) {
-	entries, err := hist.Last(n)
+func runHistoryPicker(cfg *config.Config, hist *history.History, extra []string, chat, quiet bool, rawN string) {
+	n, err := strconv.Atoi(rawN)
+	if err != nil || n <= 0 {
+		n = 10
+	}
+
+	entries, err := hist.Read()
 	if err != nil {
-		return "", err
+		fatalf("history read error: %v", err)
 	}
 	if len(entries) == 0 {
-		return "", fmt.Errorf("history is empty")
+		fmt.Println("no history yet")
+		return
 	}
+	if len(entries) > n {
+		entries = entries[len(entries)-n:]
+	}
+
 	for i, e := range entries {
-		fmt.Printf("%2d. %-30s  %s\n", i+1, e.Channel, e.Timestamp)
+		fmt.Printf("%2d. %s\n    %s\n", i+1, e.Channel, e.URL)
 	}
-	var choice int
-	fmt.Printf("\nPick a number (1–%d): ", len(entries))
-	if _, err := fmt.Scan(&choice); err != nil || choice < 1 || choice > len(entries) {
-		return "", fmt.Errorf("cancelled")
-	}
-	return entries[choice-1].URL, nil
-}
+	fmt.Printf("Pick a number (1–%d): ", len(entries))
 
-func truncate(s string, n int) string {
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
+	var pick int
+	if _, err := fmt.Scanf("%d", &pick); err != nil || pick < 1 || pick > len(entries) {
+		fmt.Println("cancelled")
+		return
 	}
-	return string(runes[:n-1]) + "…"
-}
 
-func die(err error) {
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+	e := entries[pick-1]
+	_ = hist.Append(e.Channel, e.URL, e.Game)
+	if chat {
+		openChat(cfg, e.Channel)
+	}
+	if err := player.Launch(e.URL, extra, quiet); err != nil {
+		fatalf("player error: %v", err)
 	}
 }
 
-func usage() {
-	fmt.Fprintln(os.Stderr, `usage: twtv [flags] [channel] [mpv args...]
+// toURL normalises a channel name or Twitch URL to a canonical https URL.
+func toURL(channel string) string {
+	ch := channel
+	for _, prefix := range []string{
+		"https://www.twitch.tv/",
+		"https://twitch.tv/",
+		"www.twitch.tv/",
+		"twitch.tv/",
+	} {
+		ch = strings.TrimPrefix(ch, prefix)
+	}
+	return "https://www.twitch.tv/" + ch
+}
 
-  twtv                  open TUI with live streams + history
-  twtv <channel>        play channel directly
-  twtv -H 10            pick from last 10 history entries
+// channelFromURL extracts the login name from a canonical Twitch URL.
+func channelFromURL(u string) string {
+	u = strings.TrimPrefix(u, "https://www.twitch.tv/")
+	return strings.TrimPrefix(u, "https://twitch.tv/")
+}
 
-flags:
-  -c    open chat in a new terminal window
-  -q    suppress mpv log output
-  -H N  show last N history entries (numeric picker)`)
+// openChat opens a Twitch chat window for channel in the configured terminal.
+func openChat(cfg *config.Config, channel string) {
+	term := cfg.Chat.Terminal
+	if term == "" {
+		term = terminal.Detect()
+	}
+	if term == "" {
+		return
+	}
+
+	cmd := cfg.Chat.Command
+	if strings.Contains(cmd, "<channel>") {
+		cmd = strings.ReplaceAll(cmd, "<channel>", channel)
+	} else {
+		cmd += " " + channel
+	}
+	// Ignore error — chat is best-effort and must not block stream launch.
+	_ = terminal.Launch(term, strings.Fields(cmd)...)
+}
+
+func fatalf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	os.Exit(1)
 }

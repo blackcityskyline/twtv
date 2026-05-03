@@ -1,17 +1,11 @@
+//go:build linux
+
 package player
 
-import (
-	"os/exec"
-	"syscall"
-)
+import "syscall"
 
-func sysProcAttr() *syscall.SysProcAttr {
+// detachAttr returns platform-specific process attributes that detach
+// the child from the controlling terminal, creating a new session.
+func detachAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{Setsid: true}
-}
-
-// LaunchChat opens a TUI chat app in a new terminal window.
-func LaunchChat(termPath, chatCmd, channel string) error {
-	cmd := exec.Command(termPath, "-e", chatCmd, "-c", channel)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	return cmd.Start()
 }

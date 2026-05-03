@@ -2,14 +2,17 @@ package config
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 )
 
-const defaultConfigName = "config.json"
-
-var ConfigDir = filepath.Join(os.Getenv("HOME"), ".config", "twtv")
+// Config is the top-level application configuration.
+type Config struct {
+	Auth    Auth    `json:"auth"`
+	Chat    Chat    `json:"chat"`
+	Player  Player  `json:"player"`
+	History History `json:"history"`
+}
 
 type Auth struct {
 	ClientID    string `json:"client_id"`
@@ -17,80 +20,84 @@ type Auth struct {
 }
 
 type Chat struct {
-	Terminal string `json:"terminal"` // empty = auto-detect
-	Command  string `json:"command"`  // e.g. "twt -c"
+	Terminal string `json:"terminal"` // override auto-detected terminal emulator
+	Command  string `json:"command"`  // supports <channel> placeholder
 }
 
 type Player struct {
-	Quality string `json:"quality"` // best, 720p, etc.
+	Quality string `json:"quality"`
 }
 
 type History struct {
-	Limit int `json:"limit"`
+	File  string `json:"file"`
+	Limit int    `json:"limit"`
 }
 
-type Fzf struct {
-	ShowOffline bool   `json:"show_offline"`
-	ExtraArgs   string `json:"extra_args"`
-}
-
-type Config struct {
-	Auth    Auth    `json:"auth"`
-	Chat    Chat    `json:"chat"`
-	Player  Player  `json:"player"`
-	History History `json:"history"`
-	Fzf     Fzf     `json:"fzf"`
-}
-
-func defaults() Config {
-	return Config{
-		Chat:    Chat{Command: "twt -c"},
-		Player:  Player{Quality: "best"},
-		History: History{Limit: 500},
-		Fzf:     Fzf{ShowOffline: true},
-	}
-}
-
-func path() string {
-	return filepath.Join(ConfigDir, defaultConfigName)
-}
-
-// Load reads the config file, creating it with defaults if missing.
+// Load reads the config file, creating it with defaults if absent.
 func Load() (*Config, error) {
-	cfg := defaults()
-
-	if err := os.MkdirAll(ConfigDir, 0755); err != nil {
-		return nil, fmt.Errorf("create config dir: %w", err)
-	}
-
-	p := path()
-	f, err := os.Open(p)
-	if os.IsNotExist(err) {
-		// first run — write the skeleton and return defaults
-		if err := writeDefaults(p, cfg); err != nil {
-			return nil, err
-		}
-		fmt.Fprintf(os.Stderr, "created default config at %s\n", p)
-		return &cfg, nil
-	}
+	dir, err := configDir()
 	if err != nil {
-		return nil, fmt.Errorf("open config: %w", err)
+		return nil, err
 	}
-	defer f.Close()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
 
-	if err := json.NewDecoder(f).Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
+	p := filepath.Join(dir, "config.json")
+	if _, err := os.Stat(p); os.IsNotExist(err) {
+		cfg := defaultConfig(dir)
+		return cfg, writeJSON(p, cfg)
 	}
-	return &cfg, nil
+
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return nil, err
+	}
+	cfg := defaultConfig(dir)
+	if err := json.Unmarshal(data, cfg); err != nil {
+		return nil, err
+	}
+	applyDefaults(cfg, dir)
+	return cfg, nil
 }
 
-func writeDefaults(p string, cfg Config) error {
-	f, err := os.Create(p)
-	if err != nil {
-		return fmt.Errorf("create config: %w", err)
+func defaultConfig(dir string) *Config {
+	return &Config{
+		Auth: Auth{},
+		Chat: Chat{Command: "twt -c"},
+		Player: Player{Quality: "best"},
+		History: History{
+			File:  filepath.Join(dir, "history.log"),
+			Limit: 500,
+		},
 	}
-	defer f.Close()
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	return enc.Encode(cfg)
+}
+
+// applyDefaults fills in zero-value fields that must always have a value.
+func applyDefaults(cfg *Config, dir string) {
+	if cfg.History.File == "" {
+		cfg.History.File = filepath.Join(dir, "history.log")
+	}
+	if cfg.History.Limit == 0 {
+		cfg.History.Limit = 500
+	}
+	if cfg.Chat.Command == "" {
+		cfg.Chat.Command = "twt -c"
+	}
+}
+
+func configDir() (string, error) {
+	d, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, "twtv"), nil
+}
+
+func writeJSON(path string, v any) error {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
 }

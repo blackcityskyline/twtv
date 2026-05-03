@@ -4,18 +4,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
 
 const apiBase = "https://api.twitch.tv/helix"
 
+// Client is an authenticated Twitch Helix API client.
 type Client struct {
 	clientID    string
 	accessToken string
 	http        *http.Client
 }
 
+// New returns a Client configured with the given credentials.
 func New(clientID, accessToken string) *Client {
 	return &Client{
 		clientID:    clientID,
@@ -24,22 +27,32 @@ func New(clientID, accessToken string) *Client {
 	}
 }
 
+// Stream represents a live Twitch stream.
 type Stream struct {
 	UserLogin   string `json:"user_login"`
 	UserName    string `json:"user_name"`
+	GameID      string `json:"game_id"`
 	GameName    string `json:"game_name"`
 	Title       string `json:"title"`
 	ViewerCount int    `json:"viewer_count"`
 	StartedAt   string `json:"started_at"`
 }
 
+// Game represents a Twitch category / game.
+type Game struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// Follow represents a single followed channel.
 type Follow struct {
 	BroadcasterLogin string `json:"broadcaster_login"`
 	BroadcasterName  string `json:"broadcaster_name"`
 }
 
-func (c *Client) get(url string, out any) error {
-	req, err := http.NewRequest("GET", url, nil)
+// get performs an authenticated GET request and decodes the JSON response.
+func (c *Client) get(rawURL string, out any) error {
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
 		return err
 	}
@@ -52,13 +65,13 @@ func (c *Client) get(url string, out any) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("twitch API %s: %s", url, resp.Status)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("twitch API %s: %s", rawURL, resp.Status)
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-// UserID resolves the current user's ID from the token.
+// UserID resolves the authenticated user's ID from the token.
 func (c *Client) UserID() (string, error) {
 	var res struct {
 		Data []struct {
@@ -74,22 +87,22 @@ func (c *Client) UserID() (string, error) {
 	return res.Data[0].ID, nil
 }
 
-// Follows returns all channels the user follows (paginates automatically).
+// Follows returns all channels the authenticated user follows (auto-paginated).
 func (c *Client) Follows(userID string) ([]Follow, error) {
 	var follows []Follow
 	cursor := ""
 	for {
-		url := fmt.Sprintf("%s/channels/followed?user_id=%s&first=100", apiBase, userID)
+		u := fmt.Sprintf("%s/channels/followed?user_id=%s&first=100", apiBase, userID)
 		if cursor != "" {
-			url += "&after=" + cursor
+			u += "&after=" + cursor
 		}
 		var res struct {
-			Data []Follow `json:"data"`
+			Data       []Follow `json:"data"`
 			Pagination struct {
 				Cursor string `json:"cursor"`
 			} `json:"pagination"`
 		}
-		if err := c.get(url, &res); err != nil {
+		if err := c.get(u, &res); err != nil {
 			return nil, err
 		}
 		follows = append(follows, res.Data...)
@@ -101,17 +114,16 @@ func (c *Client) Follows(userID string) ([]Follow, error) {
 	return follows, nil
 }
 
-// LiveStreams returns currently live streams for the given logins (max 100 per call).
+// LiveStreams returns currently live streams for the given logins (batched in chunks of 100).
 func (c *Client) LiveStreams(logins []string) ([]Stream, error) {
 	var streams []Stream
-	// API allows up to 100 logins per request
 	for i := 0; i < len(logins); i += 100 {
 		chunk := logins[i:min(i+100, len(logins))]
-		url := apiBase + "/streams?first=100&" + joinParams("user_login", chunk)
+		u := apiBase + "/streams?first=100&" + buildQuery("user_login", chunk)
 		var res struct {
 			Data []Stream `json:"data"`
 		}
-		if err := c.get(url, &res); err != nil {
+		if err := c.get(u, &res); err != nil {
 			return nil, err
 		}
 		streams = append(streams, res.Data...)
@@ -119,17 +131,59 @@ func (c *Client) LiveStreams(logins []string) ([]Stream, error) {
 	return streams, nil
 }
 
-func joinParams(key string, vals []string) string {
-	parts := make([]string, len(vals))
-	for i, v := range vals {
-		parts[i] = key + "=" + v
+// TopStreams returns the most-viewed live streams globally.
+func (c *Client) TopStreams(limit int) ([]Stream, error) {
+	u := fmt.Sprintf("%s/streams?first=%d", apiBase, limit)
+	var res struct {
+		Data []Stream `json:"data"`
 	}
-	return strings.Join(parts, "&")
+	if err := c.get(u, &res); err != nil {
+		return nil, err
+	}
+	return res.Data, nil
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+// TopGames returns the most popular categories / games.
+func (c *Client) TopGames(limit int) ([]Game, error) {
+	u := fmt.Sprintf("%s/games/top?first=%d", apiBase, limit)
+	var res struct {
+		Data []Game `json:"data"`
 	}
-	return b
+	if err := c.get(u, &res); err != nil {
+		return nil, err
+	}
+	return res.Data, nil
+}
+
+// StreamsByGame returns live streams for the given game ID.
+func (c *Client) StreamsByGame(gameID string, limit int) ([]Stream, error) {
+	u := fmt.Sprintf("%s/streams?game_id=%s&first=%d", apiBase, gameID, limit)
+	var res struct {
+		Data []Stream `json:"data"`
+	}
+	if err := c.get(u, &res); err != nil {
+		return nil, err
+	}
+	return res.Data, nil
+}
+
+// GamesByName looks up games by their display name.
+func (c *Client) GamesByName(names []string) ([]Game, error) {
+	u := apiBase + "/games?" + buildQuery("name", names)
+	var res struct {
+		Data []Game `json:"data"`
+	}
+	if err := c.get(u, &res); err != nil {
+		return nil, err
+	}
+	return res.Data, nil
+}
+
+// buildQuery builds a repeated query-string parameter, URL-encoding each value.
+func buildQuery(key string, vals []string) string {
+	parts := make([]string, len(vals))
+	for i, v := range vals {
+		parts[i] = key + "=" + url.QueryEscape(v)
+	}
+	return strings.Join(parts, "&")
 }

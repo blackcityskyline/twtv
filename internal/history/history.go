@@ -1,111 +1,144 @@
 package history
 
 import (
-	"bufio"
 	"fmt"
 	"os"
-	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
 
+// Entry is a single record in the watch history log.
 type Entry struct {
-	Timestamp string
-	Channel   string
-	URL       string
+	Time    string
+	Channel string
+	URL     string
+	Game    string
 }
 
-func (e Entry) String() string {
-	return fmt.Sprintf("%s\t%s\t%s", e.Timestamp, e.Channel, e.URL)
-}
-
+// History manages a tab-separated watch-history file with a rolling size limit.
 type History struct {
-	path  string
+	file  string
 	limit int
 }
 
-func New(dir string, limit int) *History {
-	return &History{
-		path:  filepath.Join(dir, "history.log"),
-		limit: limit,
+// New returns a History backed by file. limit <= 0 defaults to 500.
+func New(file string, limit int) (*History, error) {
+	if file == "" {
+		d, err := os.UserConfigDir()
+		if err != nil {
+			return nil, err
+		}
+		file = d + "/twtv/history.log"
 	}
+	if limit <= 0 {
+		limit = 500
+	}
+	return &History{file: file, limit: limit}, nil
 }
 
-func (h *History) Append(channel, url string) error {
-	if err := os.MkdirAll(filepath.Dir(h.path), 0755); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(h.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	ts := time.Now().Format("2006-01-02 15:04:05")
-	_, err = fmt.Fprintf(f, "%s\t%s\t%s\n", ts, channel, url)
-	if err != nil {
-		return err
-	}
-
-	return h.trim()
-}
-
-// Read returns all entries, most recent last.
+// Read parses and returns all history entries (oldest first).
 func (h *History) Read() ([]Entry, error) {
-	f, err := os.Open(h.path)
+	data, err := os.ReadFile(h.file)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 
-	var entries []Entry
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		parts := strings.SplitN(scanner.Text(), "\t", 3)
-		if len(parts) != 3 {
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	entries := make([]Entry, 0, len(lines))
+	for _, line := range lines {
+		if line == "" {
 			continue
 		}
-		entries = append(entries, Entry{
-			Timestamp: parts[0],
-			Channel:   parts[1],
-			URL:       parts[2],
-		})
+		parts := strings.SplitN(line, "\t", 4)
+		if len(parts) < 3 {
+			continue
+		}
+		e := Entry{Time: parts[0], Channel: parts[1], URL: parts[2]}
+		if len(parts) == 4 {
+			e.Game = parts[3]
+		}
+		entries = append(entries, e)
 	}
-	return entries, scanner.Err()
+	return entries, nil
 }
 
-// Last returns the last n entries.
-func (h *History) Last(n int) ([]Entry, error) {
-	all, err := h.Read()
-	if err != nil || len(all) <= n {
-		return all, err
+// Append adds a new entry and trims the file to the configured limit.
+func (h *History) Append(channel, url, game string) error {
+	line := fmt.Sprintf("%s\t%s\t%s\t%s\n",
+		time.Now().Format("2006-01-02 15:04:05"), channel, url, game)
+
+	f, err := os.OpenFile(h.file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
 	}
-	return all[len(all)-n:], nil
+	if _, err := f.WriteString(line); err != nil {
+		f.Close()
+		return err
+	}
+	f.Close()
+
+	return h.trim()
 }
 
-// trim keeps only the last h.limit lines.
+// TopGames returns the n most-watched game names by play count.
+func (h *History) TopGames(n int) []string {
+	entries, _ := h.Read()
+
+	counts := make(map[string]int, len(entries))
+	for _, e := range entries {
+		if e.Game != "" {
+			counts[e.Game]++
+		}
+	}
+
+	type kv struct {
+		name  string
+		count int
+	}
+	ranked := make([]kv, 0, len(counts))
+	for name, count := range counts {
+		ranked = append(ranked, kv{name, count})
+	}
+	sort.Slice(ranked, func(i, j int) bool { return ranked[i].count > ranked[j].count })
+
+	result := make([]string, 0, n)
+	for i := 0; i < len(ranked) && i < n; i++ {
+		result = append(result, ranked[i].name)
+	}
+	return result
+}
+
+// WatchedChannels returns a map of lowercase channel name → watch count.
+func (h *History) WatchedChannels() map[string]int {
+	entries, _ := h.Read()
+	counts := make(map[string]int, len(entries))
+	for _, e := range entries {
+		counts[strings.ToLower(e.Channel)]++
+	}
+	return counts
+}
+
+// trim truncates the history file to the last h.limit entries.
+// It writes atomically via a temp file to avoid data loss on crash.
 func (h *History) trim() error {
-	if h.limit <= 0 {
-		return nil
-	}
 	entries, err := h.Read()
 	if err != nil || len(entries) <= h.limit {
 		return err
 	}
 	entries = entries[len(entries)-h.limit:]
 
-	f, err := os.Create(h.path)
-	if err != nil {
+	var b strings.Builder
+	for _, e := range entries {
+		fmt.Fprintf(&b, "%s\t%s\t%s\t%s\n", e.Time, e.Channel, e.URL, e.Game)
+	}
+
+	tmp := h.file + ".tmp"
+	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
 		return err
 	}
-	defer f.Close()
-
-	w := bufio.NewWriter(f)
-	for _, e := range entries {
-		fmt.Fprintln(w, e.String())
-	}
-	return w.Flush()
+	return os.Rename(tmp, h.file)
 }
