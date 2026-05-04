@@ -7,10 +7,11 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/user/twtv/internal/blocklist"
 	"github.com/user/twtv/internal/config"
 	"github.com/user/twtv/internal/history"
+	"github.com/user/twtv/internal/muted"
 	"github.com/user/twtv/internal/player"
+	"github.com/user/twtv/internal/preview"
 	"github.com/user/twtv/internal/twitch"
 )
 
@@ -24,13 +25,18 @@ var (
 	styleViewers   = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
 	styleInput     = lipgloss.NewStyle().Foreground(lipgloss.Color("12"))
 	styleDivider   = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	styleKey       = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
 	styleErr       = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	styleTab       = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Padding(0, 1)
 	styleTabActive = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Bold(true).Background(lipgloss.Color("236")).Padding(0, 1)
 	styleHeader    = lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Bold(true)
-	styleDislike   = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	styleGame      = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
+	styleMuted     = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	styleConfirm   = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
+
+	// Key hints: bright white key + normal white description — clearly visible.
+	styleHintKey = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Bold(true)
+	styleHintVal = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
+	styleHintSep = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 )
 
 // ── tabs ──────────────────────────────────────────────────────────────────────
@@ -42,53 +48,57 @@ const (
 	tabCategories
 	tabForYou
 	tabTop
+	tabMuted
 	tabCount // sentinel — always last
 )
 
-var tabNames = [tabCount]string{"followed", "categories", "for you", "top streams"}
+var tabLabels = [tabCount]string{
+	tabFollowed:   "followed",
+	tabCategories: "categories",
+	tabForYou:     "for you",
+	tabTop:        "top",
+	tabMuted:      "muted",
+}
 
 // ── messages ──────────────────────────────────────────────────────────────────
 
-type followedLoadedMsg struct {
-	entries []tuiEntry
+type tabLoadedMsg struct {
+	t       tab
+	entries []entry
 	err     error
 }
-type topLoadedMsg struct {
-	entries []tuiEntry
-	err     error
-}
-type forYouLoadedMsg struct {
-	entries []tuiEntry
-	err     error
-}
-type categoriesLoadedMsg struct {
-	entries []tuiEntry
-	err     error
-}
+
 type gameStreamsLoadedMsg struct {
-	entries []tuiEntry
+	entries []entry
 	err     error
 }
+
+type previewDoneMsg struct{ err error }
 
 // ── data types ────────────────────────────────────────────────────────────────
 
-type tuiEntry struct {
-	channel    string
-	url        string
-	game       string
-	title      string
-	viewers    int
-	live       bool
-	isCategory bool
+// entry is a single row in any tab.
+type entry struct {
+	channel      string
+	url          string
+	game         string
+	title        string
+	thumbnailURL string
+	viewers      int
+	live         bool
+	isCategory   bool
+	isMuted      bool // true when shown in the muted tab
 }
 
-type uiMode int
+type mode int
 
 const (
-	modeList uiMode = iota
+	modeList mode = iota
 	modeFilter
 	modeChat
-	modeDislike
+	modeMuteConfirm   // "mute this channel? [y/n]"
+	modeUnmuteConfirm // "unmute this channel? [y/n]"
+	modePreview       // waiting for preview to render
 )
 
 // ── model ─────────────────────────────────────────────────────────────────────
@@ -96,19 +106,19 @@ const (
 type model struct {
 	cfg   *config.Config
 	hist  *history.History
-	bl    *blocklist.Blocklist
+	ml    *muted.List // ml = mute list
 	extra []string
 	quiet bool
 
-	tabs    [tabCount][]tuiEntry
+	tabs    [tabCount][]entry
 	loaded  [tabCount]bool
 	loading [tabCount]bool
 
 	activeTab tab
-	filtered  []tuiEntry
+	filtered  []entry
 	cursor    int
 
-	mode   uiMode
+	mode   mode
 	filter string
 	err    string
 	status string
@@ -116,13 +126,13 @@ type model struct {
 	height int
 	ready  bool
 
-	// categoryID/Name track navigation into a category's streams.
+	// category drill-down state
 	categoryID   string
 	categoryName string
 }
 
-func newModel(cfg *config.Config, hist *history.History, bl *blocklist.Blocklist, extra []string, quiet bool) model {
-	m := model{cfg: cfg, hist: hist, bl: bl, extra: extra, quiet: quiet}
+func newModel(cfg *config.Config, hist *history.History, ml *muted.List, extra []string, quiet bool) model {
+	m := model{cfg: cfg, hist: hist, ml: ml, extra: extra, quiet: quiet}
 	m.loading[tabFollowed] = true
 	return m
 }
@@ -139,22 +149,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height, m.ready = msg.Width, msg.Height, true
 
-	case followedLoadedMsg:
-		return m.handleLoad(tabFollowed, msg.entries, msg.err), nil
-
-	case topLoadedMsg:
-		return m.handleLoad(tabTop, msg.entries, msg.err), nil
-
-	case forYouLoadedMsg:
-		return m.handleLoad(tabForYou, msg.entries, msg.err), nil
-
-	case categoriesLoadedMsg:
-		m = m.handleLoad(tabCategories, msg.entries, msg.err)
-		m.categoryID, m.categoryName = "", "" // reset drill-down state
-		return m, nil
+	case tabLoadedMsg:
+		m.loading[msg.t] = false
+		m.loaded[msg.t] = true
+		if msg.err != nil {
+			m.err = msg.err.Error()
+		} else {
+			m.tabs[msg.t] = msg.entries
+		}
+		if m.activeTab == msg.t {
+			m.filtered = m.applyFilter()
+		}
 
 	case gameStreamsLoadedMsg:
-		return m.handleLoad(tabCategories, msg.entries, msg.err), nil
+		m.loading[tabCategories] = false
+		m.loaded[tabCategories] = true
+		if msg.err != nil {
+			m.err = msg.err.Error()
+		} else {
+			m.tabs[tabCategories] = msg.entries
+		}
+		if m.activeTab == tabCategories {
+			m.filtered = m.applyFilter()
+		}
+
+	case previewDoneMsg:
+		m.mode = modeList
+		if msg.err != nil {
+			m.status = "preview: " + msg.err.Error()
+		}
 
 	case tea.KeyMsg:
 		switch m.mode {
@@ -162,29 +185,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateFilter(msg)
 		case modeChat:
 			return m.updateChat(msg)
-		case modeDislike:
-			return m.updateDislike(msg)
+		case modeMuteConfirm:
+			return m.updateMuteConfirm(msg)
+		case modeUnmuteConfirm:
+			return m.updateUnmuteConfirm(msg)
+		case modePreview:
+			// block all keys while preview is rendering
 		default:
 			return m.updateList(msg)
 		}
 	}
 
 	return m, nil
-}
-
-// handleLoad is the common path for all tab-load messages.
-func (m model) handleLoad(t tab, entries []tuiEntry, err error) model {
-	m.loading[t] = false
-	m.loaded[t] = true
-	if err != nil {
-		m.err = err.Error()
-	} else {
-		m.tabs[t] = entries
-	}
-	if m.activeTab == t {
-		m.filtered = m.applyFilter()
-	}
-	return m
 }
 
 // ── key handlers ──────────────────────────────────────────────────────────────
@@ -211,6 +223,8 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.switchTab(tabForYou)
 	case "4":
 		return m.switchTab(tabTop)
+	case "5":
+		return m.switchTab(tabMuted)
 	case "tab":
 		return m.switchTab((m.activeTab + 1) % tabCount)
 
@@ -220,27 +234,40 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		e := m.filtered[m.cursor]
 		if e.isCategory {
-			return m.drillIntoCategory(e)
+			return m.drillCategory(e)
 		}
 		return m, m.launch(e)
 
+	case "p":
+		// Preview — only for live streams.
+		if len(m.filtered) > 0 && m.filtered[m.cursor].live {
+			return m.showPreview(m.filtered[m.cursor])
+		}
+
 	case "c":
-		if len(m.filtered) > 0 {
+		if len(m.filtered) > 0 && !m.filtered[m.cursor].isCategory {
 			m.mode = modeChat
 		}
-	case "d":
-		if m.activeTab == tabForYou && len(m.filtered) > 0 {
-			m.mode = modeDislike
+
+	case "m":
+		// m = mute (from any tab except muted itself)
+		if len(m.filtered) > 0 && m.activeTab != tabMuted && !m.filtered[m.cursor].isCategory {
+			m.mode = modeMuteConfirm
 		}
+
+	case "u":
+		// u = unmute (only in muted tab)
+		if len(m.filtered) > 0 && m.activeTab == tabMuted {
+			m.mode = modeUnmuteConfirm
+		}
+
 	case "/":
 		m.mode = modeFilter
 
 	case "esc", "backspace":
-		// Navigate back from category drill-down.
 		if m.activeTab == tabCategories && m.categoryID != "" {
 			return m.backToCategories()
 		}
-		// Clear active filter.
 		if m.filter != "" {
 			m.filter = ""
 			m.filtered = m.applyFilter()
@@ -287,26 +314,30 @@ func (m model) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) updateDislike(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m model) updateMuteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	e := m.filtered[m.cursor]
 	switch msg.String() {
 	case "y", "Y":
 		m.mode = modeList
-		_ = m.bl.Add(e.channel)
+		_ = m.ml.Mute(e.channel)
 
-		// Remove the blocked channel from the in-memory list immediately.
-		fresh := make([]tuiEntry, 0, len(m.tabs[tabForYou]))
-		for _, fe := range m.tabs[tabForYou] {
+		// Remove from current tab immediately.
+		fresh := make([]entry, 0, len(m.tabs[m.activeTab]))
+		for _, fe := range m.tabs[m.activeTab] {
 			if !strings.EqualFold(fe.channel, e.channel) {
 				fresh = append(fresh, fe)
 			}
 		}
-		m.tabs[tabForYou] = fresh
+		m.tabs[m.activeTab] = fresh
 		m.filtered = m.applyFilter()
 		if m.cursor >= len(m.filtered) && m.cursor > 0 {
 			m.cursor--
 		}
-		m.status = fmt.Sprintf("%s blocked from recommendations", e.channel)
+
+		// Invalidate muted tab so it reloads next time.
+		m.loaded[tabMuted] = false
+
+		m.status = fmt.Sprintf("%s muted", e.channel)
 	case "n", "N", "esc", "enter":
 		m.mode = modeList
 	case "ctrl+c":
@@ -315,7 +346,34 @@ func (m model) updateDislike(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// ── navigation helpers ────────────────────────────────────────────────────────
+func (m model) updateUnmuteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	e := m.filtered[m.cursor]
+	switch msg.String() {
+	case "y", "Y":
+		m.mode = modeList
+		_ = m.ml.Unmute(e.channel)
+
+		fresh := make([]entry, 0, len(m.tabs[tabMuted]))
+		for _, fe := range m.tabs[tabMuted] {
+			if !strings.EqualFold(fe.channel, e.channel) {
+				fresh = append(fresh, fe)
+			}
+		}
+		m.tabs[tabMuted] = fresh
+		m.filtered = m.applyFilter()
+		if m.cursor >= len(m.filtered) && m.cursor > 0 {
+			m.cursor--
+		}
+		m.status = fmt.Sprintf("%s unmuted", e.channel)
+	case "n", "N", "esc", "enter":
+		m.mode = modeList
+	case "ctrl+c":
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
+// ── navigation ────────────────────────────────────────────────────────────────
 
 func (m model) switchTab(t tab) (tea.Model, tea.Cmd) {
 	m.activeTab = t
@@ -330,12 +388,11 @@ func (m model) switchTab(t tab) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) drillIntoCategory(e tuiEntry) (tea.Model, tea.Cmd) {
+func (m model) drillCategory(e entry) (tea.Model, tea.Cmd) {
 	m.categoryID = e.channel
 	m.categoryName = e.channel
 	m.loading[tabCategories] = true
-	m.err = ""
-	m.cursor = 0
+	m.err, m.cursor = "", 0
 	m.filtered = nil
 	return m, func() tea.Msg {
 		entries, err := loadGameStreams(m.cfg, e.channel)
@@ -345,23 +402,22 @@ func (m model) drillIntoCategory(e tuiEntry) (tea.Model, tea.Cmd) {
 
 func (m model) backToCategories() (tea.Model, tea.Cmd) {
 	m.categoryID, m.categoryName = "", ""
-	m.cursor = 0
 	m.loading[tabCategories] = true
-	m.err = ""
+	m.err, m.cursor = "", 0
 	m.filtered = nil
 	return m, func() tea.Msg {
 		entries, err := loadCategories(m.cfg)
-		return categoriesLoadedMsg{entries: entries, err: err}
+		return tabLoadedMsg{t: tabCategories, entries: entries, err: err}
 	}
 }
 
-func (m model) applyFilter() []tuiEntry {
+func (m model) applyFilter() []entry {
 	src := m.tabs[m.activeTab]
 	if m.filter == "" {
 		return src
 	}
 	f := strings.ToLower(m.filter)
-	out := make([]tuiEntry, 0, len(src))
+	out := make([]entry, 0, len(src))
 	for _, e := range src {
 		if strings.Contains(strings.ToLower(e.channel), f) ||
 			strings.Contains(strings.ToLower(e.game), f) ||
@@ -372,6 +428,19 @@ func (m model) applyFilter() []tuiEntry {
 	return out
 }
 
+// ── preview ───────────────────────────────────────────────────────────────────
+
+func (m model) showPreview(e entry) (tea.Model, tea.Cmd) {
+	m.mode = modePreview
+	m.status = fmt.Sprintf("loading preview for %s…", e.channel)
+	cols := m.width
+	rows := (m.height * 2) / 3
+	return m, func() tea.Msg {
+		err := preview.Show(e.channel, cols, rows)
+		return previewDoneMsg{err: err}
+	}
+}
+
 // ── view ──────────────────────────────────────────────────────────────────────
 
 func (m model) View() string {
@@ -380,8 +449,6 @@ func (m model) View() string {
 	}
 
 	// Fixed chrome: header(1) + divider(1) + divider(1) + bottom(1) = 4 lines.
-	// renderList must fill exactly (m.height - 4) lines so the total never
-	// exceeds the terminal height and BubbleTea won't scroll the viewport.
 	const fixedLines = 4
 	listHeight := m.height - fixedLines
 	if listHeight < 1 {
@@ -396,9 +463,6 @@ func (m model) View() string {
 
 	divider := styleDivider.Render(strings.Repeat("─", max(m.width, 1)))
 
-	// Each element here is exactly one terminal line (no trailing \n).
-	// strings.Join adds the \n between them; the final \n is intentionally
-	// absent so BubbleTea controls cursor placement after the last line.
 	return m.renderHeader() + "\n" +
 		divider + "\n" +
 		m.renderList(listHeight) +
@@ -408,12 +472,12 @@ func (m model) View() string {
 
 func (m model) renderHeader() string {
 	parts := make([]string, tabCount)
-	for i, name := range tabNames {
-		label := fmt.Sprintf("[%d] %s", i+1, name)
+	for i, label := range tabLabels {
+		text := fmt.Sprintf("[%d] %s", i+1, label)
 		if tab(i) == m.activeTab {
-			parts[i] = styleTabActive.Render(label)
+			parts[i] = styleTabActive.Render(text)
 		} else {
-			parts[i] = styleTab.Render(label)
+			parts[i] = styleTab.Render(text)
 		}
 	}
 
@@ -423,61 +487,59 @@ func (m model) renderHeader() string {
 			liveCount++
 		}
 	}
-	liveStr := ""
+	live := ""
 	if liveCount > 0 {
-		liveStr = styleLive.Render(fmt.Sprintf("  %d live", liveCount))
+		live = styleLive.Render(fmt.Sprintf("  %d live", liveCount))
 	}
-	return styleHeader.Render(" twtv") + "  " + strings.Join(parts, "") + liveStr
+	return styleHeader.Render(" twtv") + "  " + strings.Join(parts, "") + live
 }
 
-// renderList renders exactly `height` lines, each terminated with \n.
-// The final character of the returned string is always \n.
+// renderList renders exactly `height` lines each ending with \n.
 func (m model) renderList(height int) string {
 	var b strings.Builder
-	linesWritten := 0
+	written := 0
 
-	writeLine := func(s string) {
+	line := func(s string) {
 		b.WriteString(s + "\n")
-		linesWritten++
+		written++
 	}
-
-	// Optional header rows (filter bar / category breadcrumb).
-	// These are already accounted for in View() via listHeight adjustments,
-	// so they don't consume from `height` here.
-	switch {
-	case m.mode == modeFilter:
-		writeLine(styleInput.Render("  / " + m.filter + "█"))
-	case m.filter != "":
-		writeLine(styleDim.Render("  / " + m.filter + "  [esc clear]"))
-	}
-	if m.activeTab == tabCategories && m.categoryID != "" {
-		writeLine(styleGame.Render(fmt.Sprintf("  Category: %s  [esc / backspace to go back]", m.categoryName)))
-	}
-	// Undo the lines we just wrote — they were pre-subtracted from height in
-	// View() and must not count toward the `height` rows we still need to fill.
-	linesWritten = 0
-
 	pad := func() {
-		for linesWritten < height {
+		for written < height {
 			b.WriteByte('\n')
-			linesWritten++
+			written++
 		}
 	}
 
+	// Optional header rows — pre-subtracted from height in View().
+	switch {
+	case m.mode == modeFilter:
+		line(styleInput.Render("  / " + m.filter + "█"))
+	case m.filter != "":
+		line(styleDim.Render("  / " + m.filter + "  [esc clear]"))
+	}
+	if m.activeTab == tabCategories && m.categoryID != "" {
+		line(styleGame.Render(fmt.Sprintf("  Category: %s  [esc to go back]", m.categoryName)))
+	}
+	written = 0 // reset: above lines don't count against height budget
+
 	switch {
 	case m.loading[m.activeTab]:
-		writeLine("")
-		writeLine("  " + styleDim.Render("fetching…"))
+		line("")
+		line("  " + styleDim.Render("fetching…"))
 		pad()
 		return b.String()
 	case m.err != "":
-		writeLine("")
-		writeLine("  " + styleErr.Render("error: "+m.err))
+		line("")
+		line("  " + styleErr.Render("error: "+m.err))
 		pad()
 		return b.String()
 	case len(m.filtered) == 0:
-		writeLine("")
-		writeLine("  " + styleDim.Render("nothing here"))
+		line("")
+		if m.activeTab == tabMuted {
+			line("  " + styleDim.Render("no muted channels"))
+		} else {
+			line("  " + styleDim.Render("nothing here"))
+		}
 		pad()
 		return b.String()
 	}
@@ -489,36 +551,40 @@ func (m model) renderList(height int) string {
 	end := min(start+height, len(m.filtered))
 
 	prevLive := true
-	for i := start; i < end && linesWritten < height; i++ {
+	for i := start; i < end && written < height; i++ {
 		e := m.filtered[i]
 
 		// Separator between live and offline sections.
-		// Only draw it if there is still room for both the separator AND the row.
-		if !e.isCategory && prevLive && !e.live && i > 0 && linesWritten+2 <= height {
-			writeLine(styleDivider.Render("  " + strings.Repeat("─", max(m.width-2, 1))))
+		if !e.isCategory && prevLive && !e.live && i > 0 && written+2 <= height {
+			line(styleDivider.Render("  " + strings.Repeat("─", max(m.width-2, 1))))
 		}
 		prevLive = e.live
 
-		if linesWritten >= height {
+		if written >= height {
 			break
 		}
 		row := m.renderRow(e)
 		if i == m.cursor {
-			writeLine(styleSelected.Render("▸ " + row))
+			line(styleSelected.Render("▸ " + row))
 		} else {
-			writeLine("  " + row)
+			line("  " + row)
 		}
 	}
 	pad()
-
 	return b.String()
 }
 
-func (m model) renderRow(e tuiEntry) string {
+func (m model) renderRow(e entry) string {
 	if e.isCategory {
 		return fmt.Sprintf("%s %s",
 			styleGame.Render("▸"),
 			styleGame.Render(fmt.Sprintf("%-22s", truncate(e.channel, 22))),
+		)
+	}
+	if e.isMuted {
+		return fmt.Sprintf("%s %s",
+			styleMuted.Render("✕"),
+			styleMuted.Render(fmt.Sprintf("%-22s", truncate(e.channel, 22))),
 		)
 	}
 
@@ -540,41 +606,54 @@ func (m model) renderRow(e tuiEntry) string {
 	)
 }
 
-// renderBottom returns a single line of text without a trailing newline.
 func (m model) renderBottom() string {
 	switch m.mode {
 	case modeChat:
 		if len(m.filtered) > 0 {
 			ch := channelFromURL(m.filtered[m.cursor].url)
-			return styleInput.Render(fmt.Sprintf("  open chat for %s? [y/n] ", ch))
+			return styleConfirm.Render(fmt.Sprintf("  open chat for %s? [y/n] ", ch))
 		}
-	case modeDislike:
+	case modeMuteConfirm:
 		if len(m.filtered) > 0 {
-			return styleDislike.Render(fmt.Sprintf("  block %s from recommendations? [y/n] ", m.filtered[m.cursor].channel))
+			return styleConfirm.Render(fmt.Sprintf("  mute %s? [y/n] ", m.filtered[m.cursor].channel))
 		}
+	case modeUnmuteConfirm:
+		if len(m.filtered) > 0 {
+			return styleConfirm.Render(fmt.Sprintf("  unmute %s? [y/n] ", m.filtered[m.cursor].channel))
+		}
+	case modePreview:
+		return styleDim.Render("  " + m.status)
 	}
 	if m.status != "" {
 		return styleDim.Render("  " + m.status)
 	}
-	return "  " + m.renderKeyHints()
+	return "  " + m.renderHints()
 }
 
-func (m model) renderKeyHints() string {
-	type kv struct{ k, v string }
-	hints := []kv{
-		{"↑↓ jk", "move"}, {"enter", "play"}, {"c", "chat"},
-		{"1-4", "tabs"}, {"/", "filter"}, {"esc", "clear/back"},
+func (m model) renderHints() string {
+	type hint struct{ key, val string }
+
+	hints := []hint{
+		{"↑↓/jk", "move"},
+		{"enter", "play"},
+		{"p", "preview"},
+		{"c", "chat"},
+		{"1-5", "tabs"},
+		{"/", "filter"},
+		{"esc", "back"},
 	}
-	if m.activeTab == tabForYou {
-		hints = append(hints, kv{"d", "dislike"})
+	if m.activeTab == tabMuted {
+		hints = append(hints, hint{"u", "unmute"})
+	} else {
+		hints = append(hints, hint{"m", "mute"})
 	}
-	hints = append(hints, kv{"q", "quit"})
+	hints = append(hints, hint{"q", "quit"})
 
 	parts := make([]string, len(hints))
 	for i, h := range hints {
-		parts[i] = styleKey.Render(h.k) + styleDim.Render(" "+h.v)
+		parts[i] = styleHintKey.Render(h.key) + styleHintVal.Render(" "+h.val)
 	}
-	return strings.Join(parts, styleDim.Render("  ·  "))
+	return strings.Join(parts, styleHintSep.Render("  ·  "))
 }
 
 // ── commands ──────────────────────────────────────────────────────────────────
@@ -583,37 +662,38 @@ func (m model) loadTab(t tab) tea.Cmd {
 	switch t {
 	case tabFollowed:
 		return func() tea.Msg {
-			entries, err := loadFollowed(m.cfg, m.hist)
-			return followedLoadedMsg{entries: entries, err: err}
+			entries, err := loadFollowed(m.cfg, m.hist, m.ml)
+			return tabLoadedMsg{t: tabFollowed, entries: entries, err: err}
 		}
 	case tabTop:
 		return func() tea.Msg {
-			entries, err := loadTop(m.cfg, m.bl)
-			return topLoadedMsg{entries: entries, err: err}
+			entries, err := loadTop(m.cfg, m.ml)
+			return tabLoadedMsg{t: tabTop, entries: entries, err: err}
 		}
 	case tabForYou:
 		return func() tea.Msg {
-			entries, err := loadForYou(m.cfg, m.hist, m.bl)
-			return forYouLoadedMsg{entries: entries, err: err}
+			entries, err := loadForYou(m.cfg, m.hist, m.ml)
+			return tabLoadedMsg{t: tabForYou, entries: entries, err: err}
 		}
 	case tabCategories:
 		return func() tea.Msg {
 			entries, err := loadCategories(m.cfg)
-			return categoriesLoadedMsg{entries: entries, err: err}
+			return tabLoadedMsg{t: tabCategories, entries: entries, err: err}
+		}
+	case tabMuted:
+		return func() tea.Msg {
+			entries := loadMuted(m.ml)
+			return tabLoadedMsg{t: tabMuted, entries: entries, err: nil}
 		}
 	}
 	return nil
 }
 
-func (m model) launch(e tuiEntry) tea.Cmd {
+func (m model) launch(e entry) tea.Cmd {
 	return func() tea.Msg {
 		_ = m.hist.Append(e.channel, e.url, e.game)
 		if err := player.Launch(e.url, m.extra, m.quiet); err != nil {
-			// Surface error back to the model via a status message.
-			// For now we accept the limitation that tea.Cmd cannot
-			// directly mutate model state; a future improvement would
-			// return a typed error message.
-			_ = err
+			_ = err // future: surface via typed msg
 		}
 		return nil
 	}
@@ -625,7 +705,7 @@ func newClient(cfg *config.Config) *twitch.Client {
 	return twitch.New(cfg.Auth.ClientID, cfg.Auth.AccessToken)
 }
 
-func loadFollowed(cfg *config.Config, hist *history.History) ([]tuiEntry, error) {
+func loadFollowed(cfg *config.Config, hist *history.History, ml *muted.List) ([]entry, error) {
 	tc := newClient(cfg)
 
 	userID, err := tc.UserID()
@@ -637,9 +717,11 @@ func loadFollowed(cfg *config.Config, hist *history.History) ([]tuiEntry, error)
 		return nil, err
 	}
 
-	logins := make([]string, len(follows))
-	for i, f := range follows {
-		logins[i] = f.BroadcasterLogin
+	logins := make([]string, 0, len(follows))
+	for _, f := range follows {
+		if !ml.Has(f.BroadcasterLogin) {
+			logins = append(logins, f.BroadcasterLogin)
+		}
 	}
 
 	streams, err := tc.LiveStreams(logins)
@@ -647,13 +729,13 @@ func loadFollowed(cfg *config.Config, hist *history.History) ([]tuiEntry, error)
 		return nil, err
 	}
 
-	entries := make([]tuiEntry, 0, len(streams))
+	entries := make([]entry, 0, len(streams))
 	for _, s := range streams {
 		entries = append(entries, streamToEntry(s))
 	}
 	sortByViewers(entries)
 
-	// Append offline followed channels from history (deduped).
+	// Append offline followed channels from history (deduped, mute-filtered).
 	seen := make(map[string]bool, len(entries))
 	for _, e := range entries {
 		seen[strings.ToLower(e.channel)] = true
@@ -662,39 +744,37 @@ func loadFollowed(cfg *config.Config, hist *history.History) ([]tuiEntry, error)
 	for i := len(histEntries) - 1; i >= 0; i-- {
 		he := histEntries[i]
 		ch := strings.ToLower(he.Channel)
-		if seen[ch] {
+		if seen[ch] || ml.Has(he.Channel) {
 			continue
 		}
 		seen[ch] = true
-		entries = append(entries, tuiEntry{channel: he.Channel, url: he.URL, game: he.Game})
+		entries = append(entries, entry{channel: he.Channel, url: he.URL, game: he.Game})
 	}
-
 	return entries, nil
 }
 
-func loadTop(cfg *config.Config, bl *blocklist.Blocklist) ([]tuiEntry, error) {
+func loadTop(cfg *config.Config, ml *muted.List) ([]entry, error) {
 	tc := newClient(cfg)
 	streams, err := tc.TopStreams(50)
 	if err != nil {
 		return nil, err
 	}
-	entries := make([]tuiEntry, 0, len(streams))
+	entries := make([]entry, 0, len(streams))
 	for _, s := range streams {
-		if !bl.Has(s.UserLogin) {
+		if !ml.Has(s.UserLogin) {
 			entries = append(entries, streamToEntry(s))
 		}
 	}
 	return entries, nil
 }
 
-func loadForYou(cfg *config.Config, hist *history.History, bl *blocklist.Blocklist) ([]tuiEntry, error) {
+func loadForYou(cfg *config.Config, hist *history.History, ml *muted.List) ([]entry, error) {
 	tc := newClient(cfg)
 
 	topGames := hist.TopGames(5)
 	if len(topGames) == 0 {
 		return nil, fmt.Errorf("watch some streams first — recommendations are based on your history")
 	}
-
 	games, err := tc.GamesByName(topGames)
 	if err != nil {
 		return nil, err
@@ -702,16 +782,16 @@ func loadForYou(cfg *config.Config, hist *history.History, bl *blocklist.Blockli
 
 	watched := hist.WatchedChannels()
 	seen := make(map[string]bool)
-	var entries []tuiEntry
+	var entries []entry
 
 	for _, g := range games {
 		streams, err := tc.StreamsByGame(g.ID, 20)
 		if err != nil {
-			continue // partial failure — skip this game, keep others
+			continue // partial failure: skip this game, keep others
 		}
 		for _, s := range streams {
 			ch := strings.ToLower(s.UserLogin)
-			if seen[ch] || bl.Has(s.UserLogin) {
+			if seen[ch] || ml.Has(s.UserLogin) {
 				continue
 			}
 			seen[ch] = true
@@ -725,20 +805,20 @@ func loadForYou(cfg *config.Config, hist *history.History, bl *blocklist.Blockli
 	return entries, nil
 }
 
-func loadCategories(cfg *config.Config) ([]tuiEntry, error) {
+func loadCategories(cfg *config.Config) ([]entry, error) {
 	tc := newClient(cfg)
 	games, err := tc.TopGames(50)
 	if err != nil {
 		return nil, err
 	}
-	entries := make([]tuiEntry, len(games))
+	entries := make([]entry, len(games))
 	for i, g := range games {
-		entries[i] = tuiEntry{channel: g.Name, isCategory: true}
+		entries[i] = entry{channel: g.Name, isCategory: true}
 	}
 	return entries, nil
 }
 
-func loadGameStreams(cfg *config.Config, gameName string) ([]tuiEntry, error) {
+func loadGameStreams(cfg *config.Config, gameName string) ([]entry, error) {
 	tc := newClient(cfg)
 	games, err := tc.GamesByName([]string{gameName})
 	if err != nil || len(games) == 0 {
@@ -748,7 +828,7 @@ func loadGameStreams(cfg *config.Config, gameName string) ([]tuiEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	entries := make([]tuiEntry, 0, len(streams))
+	entries := make([]entry, 0, len(streams))
 	for _, s := range streams {
 		entries = append(entries, streamToEntry(s))
 	}
@@ -756,20 +836,35 @@ func loadGameStreams(cfg *config.Config, gameName string) ([]tuiEntry, error) {
 	return entries, nil
 }
 
+// loadMuted builds the muted tab entries from the mute list (no API call needed).
+func loadMuted(ml *muted.List) []entry {
+	channels := ml.Channels()
+	entries := make([]entry, len(channels))
+	for i, ch := range channels {
+		entries[i] = entry{
+			channel: ch,
+			url:     toURL(ch),
+			isMuted: true,
+		}
+	}
+	return entries
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-func streamToEntry(s twitch.Stream) tuiEntry {
-	return tuiEntry{
-		channel: s.UserLogin,
-		url:     toURL(s.UserLogin),
-		game:    s.GameName,
-		title:   s.Title,
-		viewers: s.ViewerCount,
-		live:    true,
+func streamToEntry(s twitch.Stream) entry {
+	return entry{
+		channel:      s.UserLogin,
+		url:          toURL(s.UserLogin),
+		game:         s.GameName,
+		title:        s.Title,
+		thumbnailURL: s.ThumbnailURL,
+		viewers:      s.ViewerCount,
+		live:         true,
 	}
 }
 
-func sortByViewers(e []tuiEntry) {
+func sortByViewers(e []entry) {
 	for i := 1; i < len(e); i++ {
 		for j := i; j > 0 && e[j].viewers > e[j-1].viewers; j-- {
 			e[j], e[j-1] = e[j-1], e[j]
@@ -784,9 +879,15 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen-1] + "…"
 }
 
-
 func max(a, b int) int {
 	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
 		return a
 	}
 	return b

@@ -10,9 +10,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/user/twtv/internal/blocklist"
 	"github.com/user/twtv/internal/config"
 	"github.com/user/twtv/internal/history"
+	"github.com/user/twtv/internal/muted"
 	"github.com/user/twtv/internal/player"
 	"github.com/user/twtv/internal/terminal"
 )
@@ -33,16 +33,16 @@ func main() {
 		fatalf("history error: %v", err)
 	}
 
-	bl := blocklist.New(filepath.Join(filepath.Dir(cfg.History.File), "blocklist.txt"))
+	cfgDir := filepath.Dir(cfg.History.File)
+	ml := muted.Load(filepath.Join(cfgDir, "muted.txt"))
+
 	extra := flag.Args()
 
-	// -H <n>: interactive history picker
 	if *histFlag != "" {
 		runHistoryPicker(cfg, hist, extra, *chatFlag, *quietFlag, *histFlag)
 		return
 	}
 
-	// Direct channel / URL argument
 	if len(extra) > 0 {
 		url := toURL(extra[0])
 		ch := channelFromURL(url)
@@ -57,7 +57,7 @@ func main() {
 	}
 
 	// TUI mode — always quiet so mpv output doesn't corrupt the interface.
-	m := newModel(cfg, hist, bl, extra, true)
+	m := newModel(cfg, hist, ml, extra, true)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fatalf("tui error: %v", err)
@@ -132,14 +132,12 @@ func openChat(cfg *config.Config, channel string) {
 	if term == "" {
 		return
 	}
-
 	cmd := cfg.Chat.Command
 	if strings.Contains(cmd, "<channel>") {
 		cmd = strings.ReplaceAll(cmd, "<channel>", channel)
 	} else {
 		cmd += " " + channel
 	}
-	// Ignore error — chat is best-effort and must not block stream launch.
 	_ = terminal.Launch(term, strings.Fields(cmd)...)
 }
 

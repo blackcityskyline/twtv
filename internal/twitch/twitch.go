@@ -29,13 +29,14 @@ func New(clientID, accessToken string) *Client {
 
 // Stream represents a live Twitch stream.
 type Stream struct {
-	UserLogin   string `json:"user_login"`
-	UserName    string `json:"user_name"`
-	GameID      string `json:"game_id"`
-	GameName    string `json:"game_name"`
-	Title       string `json:"title"`
-	ViewerCount int    `json:"viewer_count"`
-	StartedAt   string `json:"started_at"`
+	UserLogin    string `json:"user_login"`
+	UserName     string `json:"user_name"`
+	GameID       string `json:"game_id"`
+	GameName     string `json:"game_name"`
+	Title        string `json:"title"`
+	ViewerCount  int    `json:"viewer_count"`
+	StartedAt    string `json:"started_at"`
+	ThumbnailURL string `json:"thumbnail_url"` // contains {width} and {height} placeholders
 }
 
 // Game represents a Twitch category / game.
@@ -50,7 +51,7 @@ type Follow struct {
 	BroadcasterName  string `json:"broadcaster_name"`
 }
 
-// get performs an authenticated GET request and decodes the JSON response.
+// get performs an authenticated GET and decodes the JSON response.
 func (c *Client) get(rawURL string, out any) error {
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -112,6 +113,33 @@ func (c *Client) Follows(userID string) ([]Follow, error) {
 		cursor = res.Pagination.Cursor
 	}
 	return follows, nil
+}
+
+// FollowedStreams returns live streams of all channels the user follows (auto-paginated).
+func (c *Client) FollowedStreams(userID string) ([]Stream, error) {
+	var streams []Stream
+	cursor := ""
+	for {
+		u := fmt.Sprintf("%s/streams/followed?user_id=%s&first=100", apiBase, userID)
+		if cursor != "" {
+			u += "&after=" + cursor
+		}
+		var res struct {
+			Data       []Stream `json:"data"`
+			Pagination struct {
+				Cursor string `json:"cursor"`
+			} `json:"pagination"`
+		}
+		if err := c.get(u, &res); err != nil {
+			return nil, err
+		}
+		streams = append(streams, res.Data...)
+		if res.Pagination.Cursor == "" || len(res.Data) == 0 {
+			break
+		}
+		cursor = res.Pagination.Cursor
+	}
+	return streams, nil
 }
 
 // LiveStreams returns currently live streams for the given logins (batched in chunks of 100).
@@ -186,4 +214,11 @@ func buildQuery(key string, vals []string) string {
 		parts[i] = key + "=" + url.QueryEscape(v)
 	}
 	return strings.Join(parts, "&")
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

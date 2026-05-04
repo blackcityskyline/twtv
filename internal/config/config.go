@@ -12,6 +12,7 @@ type Config struct {
 	Chat    Chat    `json:"chat"`
 	Player  Player  `json:"player"`
 	History History `json:"history"`
+	Notify  Notify  `json:"notify"`
 }
 
 type Auth struct {
@@ -20,7 +21,7 @@ type Auth struct {
 }
 
 type Chat struct {
-	Terminal string `json:"terminal"` // override auto-detected terminal emulator
+	Terminal string `json:"terminal"` // overrides auto-detected terminal emulator
 	Command  string `json:"command"`  // supports <channel> placeholder
 }
 
@@ -33,19 +34,24 @@ type History struct {
 	Limit int    `json:"limit"`
 }
 
+type Notify struct {
+	IntervalSec int    `json:"interval_sec"` // polling interval for twtv-notify daemon
+	Command     string `json:"command"`       // notification command, e.g. "notify-send"
+}
+
 // Load reads the config file, creating it with defaults if absent.
 func Load() (*Config, error) {
-	dir, err := configDir()
+	d, err := dir()
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(d, 0o755); err != nil {
 		return nil, err
 	}
 
-	p := filepath.Join(dir, "config.json")
+	p := filepath.Join(d, "config.json")
 	if _, err := os.Stat(p); os.IsNotExist(err) {
-		cfg := defaultConfig(dir)
+		cfg := defaults(d)
 		return cfg, writeJSON(p, cfg)
 	}
 
@@ -53,30 +59,45 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg := defaultConfig(dir)
+	cfg := defaults(d)
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, err
 	}
-	applyDefaults(cfg, dir)
+	fill(cfg, d)
 	return cfg, nil
 }
 
-func defaultConfig(dir string) *Config {
+// Dir returns the twtv config directory.
+func Dir() (string, error) { return dir() }
+
+func dir() (string, error) {
+	d, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, "twtv"), nil
+}
+
+func defaults(d string) *Config {
 	return &Config{
-		Auth: Auth{},
-		Chat: Chat{Command: "twt -c"},
+		Auth:   Auth{},
+		Chat:   Chat{Command: "twt -c"},
 		Player: Player{Quality: "best"},
 		History: History{
-			File:  filepath.Join(dir, "history.log"),
+			File:  filepath.Join(d, "history.log"),
 			Limit: 500,
+		},
+		Notify: Notify{
+			IntervalSec: 120,
+			Command:     "notify-send",
 		},
 	}
 }
 
-// applyDefaults fills in zero-value fields that must always have a value.
-func applyDefaults(cfg *Config, dir string) {
+// fill sets zero-value fields that must always have a value.
+func fill(cfg *Config, d string) {
 	if cfg.History.File == "" {
-		cfg.History.File = filepath.Join(dir, "history.log")
+		cfg.History.File = filepath.Join(d, "history.log")
 	}
 	if cfg.History.Limit == 0 {
 		cfg.History.Limit = 500
@@ -84,14 +105,12 @@ func applyDefaults(cfg *Config, dir string) {
 	if cfg.Chat.Command == "" {
 		cfg.Chat.Command = "twt -c"
 	}
-}
-
-func configDir() (string, error) {
-	d, err := os.UserConfigDir()
-	if err != nil {
-		return "", err
+	if cfg.Notify.IntervalSec == 0 {
+		cfg.Notify.IntervalSec = 120
 	}
-	return filepath.Join(d, "twtv"), nil
+	if cfg.Notify.Command == "" {
+		cfg.Notify.Command = "notify-send"
+	}
 }
 
 func writeJSON(path string, v any) error {
