@@ -4,9 +4,6 @@ PREFIX      := $(HOME)/.local/bin
 SYSTEMD_DIR := $(HOME)/.config/systemd/user
 
 GO          := go
-CC          := gcc
-CFLAGS      := -O2 -Wall -Wextra
-LDFLAGS     := -lcurl -ljansson
 
 .PHONY: all build build-notify install install-notify install-service \
         enable-service uninstall clean
@@ -17,7 +14,7 @@ build:
 	$(GO) build -o $(BIN) ./cmd/twtv
 
 build-notify:
-	$(CC) $(CFLAGS) -o $(NOTIFY) cmd/twtv-notify/twtv-notify.c $(LDFLAGS)
+	$(GO) build -ldflags="-s -w" -o $(NOTIFY) ./cmd/twtv-notify
 
 install: build
 	install -Dm755 $(BIN) $(PREFIX)/$(BIN)
