@@ -33,7 +33,6 @@ var (
 	styleMuted     = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	styleConfirm   = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
 
-	// Key hints: bright white key + normal white description — clearly visible.
 	styleHintKey = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Bold(true)
 	styleHintVal = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
 	styleHintSep = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
@@ -49,7 +48,7 @@ const (
 	tabForYou
 	tabTop
 	tabMuted
-	tabCount // sentinel — always last
+	tabCount
 )
 
 var tabLabels = [tabCount]string{
@@ -75,7 +74,6 @@ type gameStreamsLoadedMsg struct {
 
 // ── data types ────────────────────────────────────────────────────────────────
 
-// entry is a single row in any tab.
 type entry struct {
 	channel      string
 	url          string
@@ -85,7 +83,7 @@ type entry struct {
 	viewers      int
 	live         bool
 	isCategory   bool
-	isMuted      bool // true when shown in the muted tab
+	isMuted      bool
 }
 
 type mode int
@@ -94,8 +92,9 @@ const (
 	modeList mode = iota
 	modeFilter
 	modeChat
-	modeMuteConfirm   // "mute this channel? [y/n]"
-	modeUnmuteConfirm // "unmute this channel? [y/n]"
+	modeMuteConfirm
+	modeUnmuteConfirm
+	modeOverview // channel overview page
 )
 
 // ── model ─────────────────────────────────────────────────────────────────────
@@ -103,7 +102,7 @@ const (
 type model struct {
 	cfg   *config.Config
 	hist  *history.History
-	ml    *muted.List // ml = mute list
+	ml    *muted.List
 	extra []string
 	quiet bool
 
@@ -123,14 +122,24 @@ type model struct {
 	height int
 	ready  bool
 
-	// category drill-down state
+	// category drill-down
 	categoryID   string
 	categoryName string
+
+	// channel overview
+	overview   overviewModel
+	authUserID string // resolved once, reused for overview follow-checks
 }
 
 func newModel(cfg *config.Config, hist *history.History, ml *muted.List, extra []string, quiet bool) model {
 	m := model{cfg: cfg, hist: hist, ml: ml, extra: extra, quiet: quiet}
 	m.loading[tabFollowed] = true
+
+	// Wire the playerLaunchURL shim for overview.go.
+	playerLaunchURL = func(m model, url string) error {
+		return player.Launch(url, m.extra, m.quiet)
+	}
+
 	return m
 }
 
@@ -145,6 +154,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.width, m.height, m.ready = msg.Width, msg.Height, true
+
+	// ── overview messages ────────────────────────────────────────────────────
+
+	case overviewInfoLoadedMsg:
+		m.overview.infoLoaded = true
+		if msg.err != nil {
+			m.overview.infoErr = msg.err.Error()
+			return m, nil
+		}
+		m.overview.info = msg.info
+		// Kick off video load now that we have the broadcaster ID.
+		return m, cmdLoadOverviewVideos(m.cfg, msg.info.ID)
+
+	case overviewVideosLoadedMsg:
+		m.overview.videosLoaded = true
+		if msg.err != nil {
+			m.overview.videosErr = msg.err.Error()
+		} else {
+			m.overview.videos = msg.videos
+		}
+
+	case overviewClipsLoadedMsg:
+		m.overview.clipsLoaded = true
+		if msg.err != nil {
+			m.overview.clipsErr = msg.err.Error()
+		} else {
+			m.overview.clips = msg.clips
+		}
+
+	// ── main list messages ───────────────────────────────────────────────────
 
 	case tabLoadedMsg:
 		m.loading[msg.t] = false
@@ -177,6 +216,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.KeyMsg:
+		// Delegate to overview handler if in overview mode.
+		if m.mode == modeOverview {
+			updated, cmd, exit := m.updateOverview(msg)
+			if exit {
+				updated.mode = modeList
+			}
+			return updated, cmd
+		}
+
 		switch m.mode {
 		case modeFilter:
 			return m.updateFilter(msg)
@@ -233,8 +281,14 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.launch(e)
 
+	case "i":
+		// Open channel overview for the highlighted entry.
+		if len(m.filtered) == 0 || m.filtered[m.cursor].isCategory {
+			break
+		}
+		return m.openOverview(m.filtered[m.cursor])
+
 	case "p":
-		// Preview — only for live streams.
 		if len(m.filtered) > 0 && m.filtered[m.cursor].live {
 			return m.showPreview(m.filtered[m.cursor])
 		}
@@ -245,13 +299,11 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "m":
-		// m = mute (from any tab except muted itself)
 		if len(m.filtered) > 0 && m.activeTab != tabMuted && !m.filtered[m.cursor].isCategory {
 			m.mode = modeMuteConfirm
 		}
 
 	case "u":
-		// u = unmute (only in muted tab)
 		if len(m.filtered) > 0 && m.activeTab == tabMuted {
 			m.mode = modeUnmuteConfirm
 		}
@@ -316,7 +368,6 @@ func (m model) updateMuteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = modeList
 		_ = m.ml.Mute(e.channel)
 
-		// Remove from current tab immediately.
 		fresh := make([]entry, 0, len(m.tabs[m.activeTab]))
 		for _, fe := range m.tabs[m.activeTab] {
 			if !strings.EqualFold(fe.channel, e.channel) {
@@ -328,10 +379,7 @@ func (m model) updateMuteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.cursor >= len(m.filtered) && m.cursor > 0 {
 			m.cursor--
 		}
-
-		// Invalidate muted tab so it reloads next time.
 		m.loaded[tabMuted] = false
-
 		m.status = fmt.Sprintf("%s muted", e.channel)
 	case "n", "N", "esc", "enter":
 		m.mode = modeList
@@ -423,31 +471,32 @@ func (m model) applyFilter() []entry {
 	return out
 }
 
+// ── overview ──────────────────────────────────────────────────────────────────
+
+func (m model) openOverview(e entry) (tea.Model, tea.Cmd) {
+	m.mode = modeOverview
+	m.overview = newOverviewModel(e.channel, m.authUserID)
+	m.overview.status = ""
+	// Kick off info load (videos load after info resolves broadcaster ID).
+	return m, cmdLoadOverviewInfo(m.cfg, e.channel, m.authUserID)
+}
+
 // ── preview ───────────────────────────────────────────────────────────────────
 
-// previewDoneMsg is sent after tea.ExecProcess returns from the preview.
 type previewDoneMsg struct{ err error }
 
 func (m model) showPreview(e entry) (tea.Model, tea.Cmd) {
-	// Only live streams have a valid thumbnail URL.
 	if !e.live || e.channel == "" {
 		m.status = "preview only available for live streams"
 		return m, nil
 	}
-
-	// Download happens before ExecProcess so we can surface errors in the
-	// TUI status bar without ever leaving altscreen.
-	// cols = full width; rows = 2/3 height so the image doesn't fill the
-	// whole screen and context (title bar etc.) remains visible around it.
 	cols := m.width
 	rows := (m.height * 2) / 3
-
 	cmd, err := preview.Command(e.channel, cols, rows)
 	if err != nil {
 		m.status = "preview: " + err.Error()
 		return m, nil
 	}
-
 	return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
 		return previewDoneMsg{err: err}
 	})
@@ -459,8 +508,10 @@ func (m model) View() string {
 	if !m.ready {
 		return ""
 	}
+	if m.mode == modeOverview {
+		return m.renderOverview()
+	}
 
-	// Fixed chrome: header(1) + divider(1) + divider(1) + bottom(1) = 4 lines.
 	const fixedLines = 4
 	listHeight := m.height - fixedLines
 	if listHeight < 1 {
@@ -506,7 +557,6 @@ func (m model) renderHeader() string {
 	return styleHeader.Render(" twtv") + "  " + strings.Join(parts, "") + live
 }
 
-// renderList renders exactly `height` lines each ending with \n.
 func (m model) renderList(height int) string {
 	var b strings.Builder
 	written := 0
@@ -522,7 +572,6 @@ func (m model) renderList(height int) string {
 		}
 	}
 
-	// Optional header rows — pre-subtracted from height in View().
 	switch {
 	case m.mode == modeFilter:
 		line(styleInput.Render("  / " + m.filter + "█"))
@@ -532,7 +581,7 @@ func (m model) renderList(height int) string {
 	if m.activeTab == tabCategories && m.categoryID != "" {
 		line(styleGame.Render(fmt.Sprintf("  Category: %s  [esc to go back]", m.categoryName)))
 	}
-	written = 0 // reset: above lines don't count against height budget
+	written = 0
 
 	switch {
 	case m.loading[m.activeTab]:
@@ -566,7 +615,6 @@ func (m model) renderList(height int) string {
 	for i := start; i < end && written < height; i++ {
 		e := m.filtered[i]
 
-		// Separator between live and offline sections.
 		if !e.isCategory && prevLive && !e.live && i > 0 && written+2 <= height {
 			line(styleDivider.Render("  " + strings.Repeat("─", max(m.width-2, 1))))
 		}
@@ -646,6 +694,7 @@ func (m model) renderHints() string {
 	hints := []hint{
 		{"↑↓/jk", "move"},
 		{"enter", "play"},
+		{"i", "info"},
 		{"p", "preview"},
 		{"c", "chat"},
 		{"1-5", "tabs"},
@@ -703,7 +752,7 @@ func (m model) launch(e entry) tea.Cmd {
 	return func() tea.Msg {
 		_ = m.hist.Append(e.channel, e.url, e.game)
 		if err := player.Launch(e.url, m.extra, m.quiet); err != nil {
-			_ = err // future: surface via typed msg
+			_ = err
 		}
 		return nil
 	}
@@ -745,7 +794,6 @@ func loadFollowed(cfg *config.Config, hist *history.History, ml *muted.List) ([]
 	}
 	sortByViewers(entries)
 
-	// Append offline followed channels from history (deduped, mute-filtered).
 	seen := make(map[string]bool, len(entries))
 	for _, e := range entries {
 		seen[strings.ToLower(e.channel)] = true
@@ -797,7 +845,7 @@ func loadForYou(cfg *config.Config, hist *history.History, ml *muted.List) ([]en
 	for _, g := range games {
 		streams, err := tc.StreamsByGame(g.ID, 20)
 		if err != nil {
-			continue // partial failure: skip this game, keep others
+			continue
 		}
 		for _, s := range streams {
 			ch := strings.ToLower(s.UserLogin)
@@ -806,7 +854,7 @@ func loadForYou(cfg *config.Config, hist *history.History, ml *muted.List) ([]en
 			}
 			seen[ch] = true
 			e := streamToEntry(s)
-			e.viewers += watched[ch] * 100 // boost previously watched channels
+			e.viewers += watched[ch] * 100
 			entries = append(entries, e)
 		}
 	}
@@ -846,7 +894,6 @@ func loadGameStreams(cfg *config.Config, gameName string) ([]entry, error) {
 	return entries, nil
 }
 
-// loadMuted builds the muted tab entries from the mute list (no API call needed).
 func loadMuted(ml *muted.List) []entry {
 	channels := ml.Channels()
 	entries := make([]entry, len(channels))
