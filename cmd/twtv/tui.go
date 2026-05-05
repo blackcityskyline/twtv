@@ -73,8 +73,6 @@ type gameStreamsLoadedMsg struct {
 	err     error
 }
 
-type previewDoneMsg struct{ err error }
-
 // ── data types ────────────────────────────────────────────────────────────────
 
 // entry is a single row in any tab.
@@ -98,7 +96,6 @@ const (
 	modeChat
 	modeMuteConfirm   // "mute this channel? [y/n]"
 	modeUnmuteConfirm // "unmute this channel? [y/n]"
-	modePreview       // waiting for preview to render
 )
 
 // ── model ─────────────────────────────────────────────────────────────────────
@@ -189,8 +186,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateMuteConfirm(msg)
 		case modeUnmuteConfirm:
 			return m.updateUnmuteConfirm(msg)
-		case modePreview:
-			// block all keys while preview is rendering
 		default:
 			return m.updateList(msg)
 		}
@@ -430,15 +425,32 @@ func (m model) applyFilter() []entry {
 
 // ── preview ───────────────────────────────────────────────────────────────────
 
+// previewDoneMsg is sent after tea.ExecProcess returns from the preview.
+type previewDoneMsg struct{ err error }
+
 func (m model) showPreview(e entry) (tea.Model, tea.Cmd) {
-	m.mode = modePreview
-	m.status = fmt.Sprintf("loading preview for %s…", e.channel)
+	// Only live streams have a valid thumbnail URL.
+	if !e.live || e.channel == "" {
+		m.status = "preview only available for live streams"
+		return m, nil
+	}
+
+	// Download happens before ExecProcess so we can surface errors in the
+	// TUI status bar without ever leaving altscreen.
+	// cols = full width; rows = 2/3 height so the image doesn't fill the
+	// whole screen and context (title bar etc.) remains visible around it.
 	cols := m.width
 	rows := (m.height * 2) / 3
-	return m, func() tea.Msg {
-		err := preview.Show(e.channel, cols, rows)
-		return previewDoneMsg{err: err}
+
+	cmd, err := preview.Command(e.channel, cols, rows)
+	if err != nil {
+		m.status = "preview: " + err.Error()
+		return m, nil
 	}
+
+	return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
+		return previewDoneMsg{err: err}
+	})
 }
 
 // ── view ──────────────────────────────────────────────────────────────────────
@@ -621,8 +633,6 @@ func (m model) renderBottom() string {
 		if len(m.filtered) > 0 {
 			return styleConfirm.Render(fmt.Sprintf("  unmute %s? [y/n] ", m.filtered[m.cursor].channel))
 		}
-	case modePreview:
-		return styleDim.Render("  " + m.status)
 	}
 	if m.status != "" {
 		return styleDim.Render("  " + m.status)
