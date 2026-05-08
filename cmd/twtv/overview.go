@@ -2,25 +2,24 @@ package main
 
 // overview.go — channel overview page (key: i)
 //
-// Layout (conceptual):
+// Sixel avatar rendering:
+// For sixel terminals (foot) the image cannot live inside View() because
+// BubbleTea overwrites those screen cells on the next redraw.
+// Instead we store the raw image bytes in overviewModel.avatarData and
+// call avatar.DrawSixelAt() from cmdDrawAvatar() — a tea.Cmd that writes
+// the sixel escape directly to os.Stdout at the known screen position.
 //
-//   ┌──────────────────────────────────────────────────────┐
-//   │  twtv  ‹ channelname                                 │  header
-//   ├──────────────────────────────────────────────────────┤
-//   │  DisplayName  ● LIVE  1.2K viewers  ✓ following      │
-//   │  Followers: 345.6K  •  Playing: Some Game            │
-//   │  Description text wrapped to terminal width…         │
-//   ├──────────────────────────────────────────────────────┤
-//   │  [videos]  [clips]          [ prev  ] next           │  sub-tabs
-//   ├──────────────────────────────────────────────────────┤
-//   │  ▸ VOD  Title of stream            2h34m  1234 views │
-//   │    …                                                 │
-//   ├──────────────────────────────────────────────────────┤
-//   │  ↑↓/jk move · enter play · p preview · [ ] tabs …   │  hints
-//   └──────────────────────────────────────────────────────┘
+// Avatar screen position (1-based terminal rows/cols):
+//   row = 3  (row 1: header, row 2: divider, row 3: first info line)
+//   col = 3  (2 spaces indent + 1 for 1-based)
 //
-// Sub-tab navigation uses [ and ] so it never conflicts with
-// the global 1-5 / Tab keys of the main list.
+// cmdDrawAvatar is dispatched:
+//   • when avatarData is first received (overviewAvatarLoadedMsg)
+//   • on every WindowSizeMsg while in modeOverview (screen was redrawn)
+//   • after any key that causes a View() redraw in modeOverview
+//
+// For kitty: avatar is embedded in View() via renderKitty() as before.
+// For symbols: avatar is embedded in View() as plain UTF-8 block art.
 
 import (
 	"fmt"
@@ -29,10 +28,27 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/user/twtv/internal/avatar"
 	"github.com/user/twtv/internal/config"
 	"github.com/user/twtv/internal/preview"
 	"github.com/user/twtv/internal/twitch"
 )
+
+// ── avatar dimensions ─────────────────────────────────────────────────────────
+
+const (
+	avatarCols  = 8 // character columns
+	avatarRows  = 4 // character rows
+	avatarGapOv = 3 // must equal avatar.avatarGap
+
+	// avatarScreenRow/Col: 1-based terminal coordinates of the avatar cell.
+	// Row 1 = header, Row 2 = divider → avatar starts at row 3.
+	// Col 1+2 = "  " indent → avatar starts at col 3.
+	avatarScreenRow = 3
+	avatarScreenCol = 3
+)
+
+const avatarIndent = 2 + avatarCols + avatarGapOv
 
 // ── sub-tabs ──────────────────────────────────────────────────────────────────
 
@@ -82,6 +98,11 @@ type overviewInfoLoadedMsg struct {
 	err  error
 }
 
+type overviewAvatarLoadedMsg struct {
+	data  []byte   // raw image bytes (for sixel direct-draw)
+	lines []string // rendered lines (for kitty/symbols, nil for sixel)
+}
+
 type overviewVideosLoadedMsg struct {
 	videos []twitch.Video
 	err    error
@@ -92,15 +113,23 @@ type overviewClipsLoadedMsg struct {
 	err   error
 }
 
+type ovCleanupMsg struct{}
+type ovAvatarDrawnMsg struct{} // returned after DrawSixelAt completes
+
 // ── data model ────────────────────────────────────────────────────────────────
 
 type overviewModel struct {
 	login  string
-	userID string // authenticated user id (for follow check)
+	userID string
 
 	info       *twitch.ChannelInfo
 	infoErr    string
 	infoLoaded bool
+
+	// avatarData holds raw image bytes for sixel direct-draw.
+	avatarData  []byte
+	avatarLines []string // for kitty/symbols
+	avatarReady bool
 
 	videos       []twitch.Video
 	videosErr    string
@@ -119,7 +148,6 @@ func newOverviewModel(login, authUserID string) overviewModel {
 	return overviewModel{login: login, userID: authUserID}
 }
 
-// currentLen returns the row count in the active sub-tab.
 func (ov *overviewModel) currentLen() int {
 	switch ov.activeSubTab {
 	case ovTabVideos:
@@ -130,7 +158,6 @@ func (ov *overviewModel) currentLen() int {
 	return 0
 }
 
-// selectedURL returns the playable URL of the highlighted row.
 func (ov *overviewModel) selectedURL() string {
 	switch ov.activeSubTab {
 	case ovTabVideos:
@@ -145,7 +172,6 @@ func (ov *overviewModel) selectedURL() string {
 	return ""
 }
 
-// selectedThumb returns the thumbnail URL of the highlighted row.
 func (ov *overviewModel) selectedThumb() string {
 	switch ov.activeSubTab {
 	case ovTabVideos:
@@ -160,13 +186,38 @@ func (ov *overviewModel) selectedThumb() string {
 	return ""
 }
 
-// ── init commands ─────────────────────────────────────────────────────────────
+// ── commands ──────────────────────────────────────────────────────────────────
 
 func cmdLoadOverviewInfo(cfg *config.Config, login, authUserID string) tea.Cmd {
 	return func() tea.Msg {
 		tc := twitch.New(cfg.Auth.ClientID, cfg.Auth.AccessToken)
 		info, err := tc.ChannelInfoByLogin(login, authUserID)
 		return overviewInfoLoadedMsg{info: info, err: err}
+	}
+}
+
+// cmdLoadOverviewAvatar downloads image data and pre-renders for kitty/symbols.
+// For sixel the lines will be nil; drawing happens via cmdDrawAvatar.
+func cmdLoadOverviewAvatar(profileImageURL string) tea.Cmd {
+	return func() tea.Msg {
+		data, err := avatar.Download(profileImageURL)
+		if err != nil || len(data) == 0 {
+			return overviewAvatarLoadedMsg{}
+		}
+		lines := avatar.RenderData(data, avatarCols, avatarRows)
+		return overviewAvatarLoadedMsg{data: data, lines: lines}
+	}
+}
+
+// cmdDrawAvatar writes the sixel image directly to stdout at the avatar position.
+// For kitty/symbols this is a no-op (image is already in View()).
+func cmdDrawAvatar(data []byte) tea.Cmd {
+	return func() tea.Msg {
+		if len(data) > 0 && avatar.IsSixel() {
+			_ = avatar.DrawSixelAt(data, avatarCols, avatarRows,
+				avatarScreenRow, avatarScreenCol)
+		}
+		return ovAvatarDrawnMsg{}
 	}
 }
 
@@ -186,10 +237,17 @@ func cmdLoadOverviewClips(cfg *config.Config, broadcasterID string) tea.Cmd {
 	}
 }
 
+func cmdCleanupAvatar() tea.Cmd {
+	return func() tea.Msg {
+		if esc := avatar.DeleteAll(); esc != "" {
+			fmt.Print(esc)
+		}
+		return ovCleanupMsg{}
+	}
+}
+
 // ── key handler ───────────────────────────────────────────────────────────────
 
-// updateOverview handles key input in modeOverview.
-// Returns (model, cmd, exitOverview).
 func (m model) updateOverview(msg tea.KeyMsg) (model, tea.Cmd, bool) {
 	ov := &m.overview
 
@@ -198,7 +256,8 @@ func (m model) updateOverview(msg tea.KeyMsg) (model, tea.Cmd, bool) {
 		return m, tea.Quit, false
 
 	case "i", "esc":
-		return m, nil, true // exit overview, back to main list
+		m.overview = *ov
+		return m, cmdCleanupAvatar(), false
 
 	case "up", "k":
 		if ov.cursor > 0 {
@@ -218,7 +277,6 @@ func (m model) updateOverview(msg tea.KeyMsg) (model, tea.Cmd, bool) {
 		if ov.activeSubTab < ovTabCount-1 {
 			ov.activeSubTab++
 			ov.cursor = 0
-			// Lazy-load clips on first visit.
 			if ov.activeSubTab == ovTabClips && !ov.clipsLoaded && ov.info != nil {
 				m.overview = *ov
 				return m, cmdLoadOverviewClips(m.cfg, ov.info.ID), false
@@ -260,7 +318,8 @@ func (m model) updateOverview(msg tea.KeyMsg) (model, tea.Cmd, bool) {
 	}
 
 	m.overview = *ov
-	return m, nil, false
+	// After any key redraw, repaint the sixel avatar.
+	return m, cmdDrawAvatar(ov.avatarData), false
 }
 
 // ── view ──────────────────────────────────────────────────────────────────────
@@ -269,23 +328,18 @@ func (m model) renderOverview() string {
 	divider := styleOvDivider.Render(strings.Repeat("─", max(m.width, 1)))
 	var b strings.Builder
 
-	// Header
 	b.WriteString(styleOvHeader.Render(" twtv") + "  " +
 		styleOvBack.Render("‹ ") + styleOvName.Render(m.overview.login) + "\n")
 	b.WriteString(divider + "\n")
 
-	// Channel info block
 	infoLines := m.renderOvInfo()
 	for _, l := range infoLines {
 		b.WriteString(l + "\n")
 	}
 	b.WriteString(divider + "\n")
-
-	// Sub-tab bar
 	b.WriteString(m.renderOvSubTabBar() + "\n")
 	b.WriteString(divider + "\n")
 
-	// Fixed chrome: header+div + len(infoLines)+div + subtab+div + bottom = 4 + infoLines
 	fixedLines := 1 + 1 + len(infoLines) + 1 + 1 + 1 + 1
 	listHeight := m.height - fixedLines
 	if listHeight < 1 {
@@ -299,8 +353,14 @@ func (m model) renderOverview() string {
 	return b.String()
 }
 
+// renderOvInfo builds the info block.
+//
+// For sixel: the avatar area is a plain space placeholder — actual image is
+// painted by cmdDrawAvatar after BubbleTea flushes View() to the terminal.
+// For kitty/symbols: av[i] is embedded directly.
 func (m model) renderOvInfo() []string {
 	ov := m.overview
+
 	if !ov.infoLoaded {
 		return []string{"", "  " + styleOvDim.Render("fetching channel info…")}
 	}
@@ -312,42 +372,75 @@ func (m model) renderOvInfo() []string {
 		return []string{"  " + styleOvDim.Render("no info")}
 	}
 
-	var lines []string
+	// ── text column ───────────────────────────────────────────────────────────
 
-	// Line 1: DisplayName · live/offline · following badge
+	var textLines []string
+
 	liveStr := " " + styleOvOffline.Render("○ offline")
 	if info.IsLive {
 		liveStr = " " + styleOvLive.Render("● LIVE") +
-			" " + styleOvViewers.Render(formatViewers(info.ViewerCount)+" viewers")
-		if info.StartedAt != "" {
-			liveStr += " " + styleOvDim.Render("since "+formatStartedAt(info.StartedAt))
-		}
+			" " + styleOvViewers.Render(formatViewers(info.ViewerCount)+" viewers") +
+			" " + styleOvDim.Render("since "+formatStartedAt(info.StartedAt))
 	}
 	followBadge := ""
 	if info.IsFollowing {
 		followBadge = "  " + styleOvFollowing.Render("✓ following")
 	}
-	lines = append(lines, "  "+styleOvName.Render(info.DisplayName)+liveStr+followBadge)
+	textLines = append(textLines, styleOvName.Render(info.DisplayName)+liveStr+followBadge)
 
-	// Line 2: followers · game
-	meta := "Followers: " + formatFollowers(info.FollowerCount)
+	line2 := styleOvMeta.Render("Followers: " + formatFollowers(info.FollowerCount))
 	if info.GameName != "" {
-		meta += "  •  "
+		line2 += styleOvMeta.Render("  •  ") + styleOvGame.Render("Playing: "+info.GameName)
 	}
-	line2 := "  " + styleOvMeta.Render(meta)
-	if info.GameName != "" {
-		line2 += styleOvGame.Render("Playing: "+info.GameName)
-	}
-	lines = append(lines, line2)
+	textLines = append(textLines, line2)
 
-	// Lines 3+: description (wrapped, max 3 lines)
 	if desc := strings.TrimSpace(info.Description); desc != "" {
-		for _, l := range wrapText(desc, m.width-4, 3) {
-			lines = append(lines, "  "+styleOvDesc.Render(l))
+		textW := m.width - avatarIndent
+		if textW < 20 {
+			textW = 20
+		}
+		for _, l := range wrapText(desc, textW, 4) {
+			textLines = append(textLines, styleOvDesc.Render(l))
 		}
 	}
 
-	return lines
+	// ── merge avatar + text ───────────────────────────────────────────────────
+
+	av := ov.avatarLines
+	isSixel := avatar.IsSixel()
+	useEscape := avatar.IsEscapeProtocol() && !isSixel && len(av) > 0
+	placeholder := strings.Repeat(" ", avatarCols)
+	gap := strings.Repeat(" ", avatarGapOv)
+
+	nRows := max(max(len(av), len(textLines)), avatarRows)
+	result := make([]string, nRows)
+
+	for i := range result {
+		txLine := ""
+		if i < len(textLines) {
+			txLine = textLines[i]
+		}
+
+		if isSixel {
+			// Sixel: leave plain spaces as placeholder, image painted separately.
+			result[i] = "  " + placeholder + gap + txLine
+		} else if useEscape {
+			// Kitty: av[i] contains escape sequences with zero printable width.
+			avEsc := ""
+			if i < len(av) {
+				avEsc = av[i]
+			}
+			result[i] = "  " + avEsc + txLine
+		} else {
+			// Symbols: plain UTF-8 block art.
+			avLine := placeholder
+			if i < len(av) {
+				avLine = av[i]
+			}
+			result[i] = "  " + avLine + gap + txLine
+		}
+	}
+	return result
 }
 
 func (m model) renderOvSubTabBar() string {
@@ -360,8 +453,7 @@ func (m model) renderOvSubTabBar() string {
 			parts[i] = styleOvSubTab.Render(txt)
 		}
 	}
-	nav := styleOvDim.Render("  [ prev  ] next")
-	return "  " + strings.Join(parts, "  ") + nav
+	return "  " + strings.Join(parts, "  ") + styleOvDim.Render("  [ prev  ] next")
 }
 
 func (m model) renderOvList(height int) string {
@@ -369,10 +461,7 @@ func (m model) renderOvList(height int) string {
 	var b strings.Builder
 	written := 0
 
-	writeLine := func(s string) {
-		b.WriteString(s + "\n")
-		written++
-	}
+	wl := func(s string) { b.WriteString(s + "\n"); written++ }
 	pad := func() {
 		for written < height {
 			b.WriteByte('\n')
@@ -383,20 +472,20 @@ func (m model) renderOvList(height int) string {
 	switch ov.activeSubTab {
 	case ovTabVideos:
 		if !ov.videosLoaded {
-			writeLine("")
-			writeLine("  " + styleOvDim.Render("fetching videos…"))
+			wl("")
+			wl("  " + styleOvDim.Render("fetching videos…"))
 			pad()
 			return b.String()
 		}
 		if ov.videosErr != "" {
-			writeLine("")
-			writeLine("  " + styleOvErr.Render("error: "+ov.videosErr))
+			wl("")
+			wl("  " + styleOvErr.Render("error: "+ov.videosErr))
 			pad()
 			return b.String()
 		}
 		if len(ov.videos) == 0 {
-			writeLine("")
-			writeLine("  " + styleOvDim.Render("no videos found"))
+			wl("")
+			wl("  " + styleOvDim.Render("no videos found"))
 			pad()
 			return b.String()
 		}
@@ -404,28 +493,28 @@ func (m model) renderOvList(height int) string {
 		for i := start; i < end && written < height; i++ {
 			row := m.renderVideoRow(ov.videos[i])
 			if i == ov.cursor {
-				writeLine(styleOvSelected.Render("▸ " + row))
+				wl(styleOvSelected.Render("▸ " + row))
 			} else {
-				writeLine("  " + row)
+				wl("  " + row)
 			}
 		}
 
 	case ovTabClips:
 		if !ov.clipsLoaded {
-			writeLine("")
-			writeLine("  " + styleOvDim.Render("fetching clips…"))
+			wl("")
+			wl("  " + styleOvDim.Render("fetching clips…"))
 			pad()
 			return b.String()
 		}
 		if ov.clipsErr != "" {
-			writeLine("")
-			writeLine("  " + styleOvErr.Render("error: "+ov.clipsErr))
+			wl("")
+			wl("  " + styleOvErr.Render("error: "+ov.clipsErr))
 			pad()
 			return b.String()
 		}
 		if len(ov.clips) == 0 {
-			writeLine("")
-			writeLine("  " + styleOvDim.Render("no clips found"))
+			wl("")
+			wl("  " + styleOvDim.Render("no clips found"))
 			pad()
 			return b.String()
 		}
@@ -433,9 +522,9 @@ func (m model) renderOvList(height int) string {
 		for i := start; i < end && written < height; i++ {
 			row := m.renderClipRow(ov.clips[i])
 			if i == ov.cursor {
-				writeLine(styleOvSelected.Render("▸ " + row))
+				wl(styleOvSelected.Render("▸ " + row))
 			} else {
-				writeLine("  " + row)
+				wl("  " + row)
 			}
 		}
 	}
@@ -450,7 +539,6 @@ func (m model) renderVideoRow(v twitch.Video) string {
 	dur := styleOvDuration.Render(fmt.Sprintf("%8s", v.Duration))
 	views := styleOvViewers.Render(fmt.Sprintf("%7d views", v.ViewCount))
 	date := styleOvDim.Render(shortDate(v.PublishedAt))
-	// tag(3) + sp + title + sp + dur(8) + sp + views(12) + sp + date(10)
 	metaW := 3 + 1 + 8 + 1 + 12 + 1 + 10
 	titleW := max(w-metaW, 10)
 	title := fmt.Sprintf("%-*s", titleW, truncate(v.Title, titleW))
@@ -491,7 +579,6 @@ func (m model) renderOvBottom() string {
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 func ovScrollWindow(cursor, height, total int) (start, end int) {
-	start = 0
 	if cursor >= height {
 		start = cursor - height + 1
 	}
@@ -548,7 +635,6 @@ func shortDate(s string) string {
 	return s
 }
 
-// wrapText breaks text into at most maxLines lines of at most maxWidth runes.
 func wrapText(text string, maxWidth, maxLines int) []string {
 	if maxWidth <= 0 {
 		return []string{text}
@@ -561,9 +647,6 @@ func wrapText(text string, maxWidth, maxLines int) []string {
 			if cur != "" {
 				lines = append(lines, cur)
 				if len(lines) >= maxLines {
-					if len(lines[len(lines)-1]) > maxWidth-1 {
-						lines[len(lines)-1] = lines[len(lines)-1][:maxWidth-1] + "…"
-					}
 					return lines
 				}
 			}
@@ -582,6 +665,4 @@ func wrapText(text string, maxWidth, maxLines int) []string {
 	return lines
 }
 
-// playerLaunchURL is a thin shim so overview.go does not import player directly.
-// It is defined in tui.go.
 var playerLaunchURL func(m model, url string) error

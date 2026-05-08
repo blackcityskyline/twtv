@@ -151,9 +151,11 @@ func (m model) Init() tea.Cmd {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-
 	case tea.WindowSizeMsg:
 		m.width, m.height, m.ready = msg.Width, msg.Height, true
+		if m.mode == modeOverview && len(m.overview.avatarData) > 0 {
+			return m, cmdDrawAvatar(m.overview.avatarData)
+		}
 
 	// ── overview messages ────────────────────────────────────────────────────
 
@@ -164,8 +166,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.overview.info = msg.info
-		// Kick off video load now that we have the broadcaster ID.
-		return m, cmdLoadOverviewVideos(m.cfg, msg.info.ID)
+		return m, tea.Batch(
+			cmdLoadOverviewVideos(m.cfg, msg.info.ID),
+			cmdLoadOverviewAvatar(msg.info.ProfileImageURL),
+		)
+
+	case overviewAvatarLoadedMsg:
+		m.overview.avatarReady = true
+		m.overview.avatarData = msg.data
+		m.overview.avatarLines = msg.lines
+		if len(msg.data) > 0 {
+			return m, cmdDrawAvatar(msg.data)
+		}
 
 	case overviewVideosLoadedMsg:
 		m.overview.videosLoaded = true
@@ -215,8 +227,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "preview: " + msg.err.Error()
 		}
 
+	case ovCleanupMsg:
+		m.mode = modeList
+
+	case ovAvatarDrawnMsg:
+		// no-op: draw completed, nothing to update in model
+
 	case tea.KeyMsg:
-		// Delegate to overview handler if in overview mode.
 		if m.mode == modeOverview {
 			updated, cmd, exit := m.updateOverview(msg)
 			if exit {
@@ -636,13 +653,15 @@ func (m model) renderList(height int) string {
 
 func (m model) renderRow(e entry) string {
 	if e.isCategory {
-		return fmt.Sprintf("%s %s",
+		return fmt.Sprintf(
+			"%s %s",
 			styleGame.Render("▸"),
 			styleGame.Render(fmt.Sprintf("%-22s", truncate(e.channel, 22))),
 		)
 	}
 	if e.isMuted {
-		return fmt.Sprintf("%s %s",
+		return fmt.Sprintf(
+			"%s %s",
 			styleMuted.Render("✕"),
 			styleMuted.Render(fmt.Sprintf("%-22s", truncate(e.channel, 22))),
 		)
@@ -652,14 +671,16 @@ func (m model) renderRow(e entry) string {
 	ch := fmt.Sprintf("%-22s", truncate(e.channel, 22))
 	if e.live {
 		metaW := max(w-22-7-2, 10)
-		return fmt.Sprintf("%s %s %s  %s",
+		return fmt.Sprintf(
+			"%s %s %s  %s",
 			styleLive.Render("●"),
 			styleLive.Render(ch),
 			styleViewers.Render(fmt.Sprintf("%6d", e.viewers)),
 			styleDim.Render(truncate(e.game+" — "+e.title, metaW)),
 		)
 	}
-	return fmt.Sprintf("%s %s  %s",
+	return fmt.Sprintf(
+		"%s %s  %s",
 		styleOffline.Render("○"),
 		styleOffline.Render(ch),
 		styleDim.Render("offline"),
